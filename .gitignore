@@ -1,0 +1,8 @@
+node_modules/
+.artifacts/
+dist/
+data/
+*.exe
+*.pdb
+*.dll
+*.local.json
