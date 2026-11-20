@@ -247,12 +247,21 @@ export function renderPage(): string {
     const path = el('editor-path').value.trim();
     el('editor-text').readOnly = !!loaded && !loaded.complete && (path === loaded.path || path === loaded.inputPath);
   });
-  el('editor-form').addEventListener('submit',event => {
-    event.preventDefault(); const path = el('editor-path').value.trim();
+  el('editor-form').addEventListener('submit',async event => {
+    event.preventDefault(); if (!need('write')) return;
+    const path = el('editor-path').value.trim();
     const existing = loaded && (loaded.path === path || loaded.inputPath === path);
     if (existing && !loaded.complete) { say('尚未读取完整文件，不能覆盖保存。',true); return; }
     const operation = {action:'write',path,text:el('editor-text').value,...(existing ? {expectedSha256:loaded.sha256} : {createOnly:true})};
-    return task([operation],'write',el('files-result'),result => { const data = success(result); if (data?.sha256) { loaded = {path:data.path || path,inputPath:path,sha256:data.sha256,complete:true}; el('editor-text').readOnly = false; el('read-more').hidden = true; el('editor-note').textContent = (mutationMessage(data) || '已收到文件保存结果。') + '后续覆盖仍会核对当前版本。'; } });
+    const pathReadOnly = el('editor-path').readOnly;
+    el('editor-path').readOnly = true; el('editor-text').readOnly = true;
+    try {
+      return await task([operation],'write',el('files-result'),result => { const data = success(result); if (data?.sha256) { loaded = {path:data.path || path,inputPath:path,sha256:data.sha256,complete:true}; el('read-more').hidden = true; el('editor-note').textContent = (mutationMessage(data) || '已收到文件保存结果。') + '后续覆盖仍会核对当前版本。'; } });
+    } finally {
+      el('editor-path').readOnly = pathReadOnly;
+      const current = el('editor-path').value.trim();
+      el('editor-text').readOnly = !!loaded && !loaded.complete && (current === loaded.path || current === loaded.inputPath);
+    }
   });
   el('delete-file').addEventListener('click',() => {
     const path = el('editor-path').value.trim();

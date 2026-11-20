@@ -21,6 +21,9 @@ type Page<T> = { items: T[]; total: number; truncated: boolean; nextOffset?: num
 type WriteOptions = { expectedSha256?: string; createOnly?: boolean; reason?: 'overwrite' | 'restore'; signal?: AbortSignal; backupPolicy: BackupPolicy };
 
 function fail(code: string, message: string): never { throw new ComputerError(code, message); }
+function unverifiedWrite(backupId?: string, cleanupIncomplete = false): never {
+  fail('WRITE_UNVERIFIED', `写入后未能核验最终文件，目标可能已改变；请先读取核对，不要自动重试。${cleanupIncomplete ? '本次临时文件清理未完成。' : ''}${backupId ? `原内容副本：${backupId}。` : ''}`);
+}
 function checkSignal(signal?: AbortSignal): void { signal?.throwIfAborted(); }
 function sha(bytes: Uint8Array): string { return createHash('sha256').update(bytes).digest('hex'); }
 function same(a: string, b: string): boolean { return resolve(a).toLowerCase() === resolve(b).toLowerCase(); }
@@ -366,17 +369,25 @@ export class FileStore {
     const backupId = existing ? await this.#backup(path, existing.bytes, options.reason ?? 'overwrite', options.backupPolicy) : undefined;
     const temp = join(dirname(path), `.computer-write-${randomUUID()}.tmp`);
     await this.#writeNew(temp, bytes);
+    let published = false;
     try {
       checkSignal(options.signal);
       await this.#path(scope, path, true);
       await this.#existing(scope, path, options);
-      if (existing) await rename(temp, path);
+      if (existing) { await rename(temp, path); published = true; }
       else {
         // link is an atomic create-if-absent; copyFile(EXCL) can expose partial bytes.
         try { await link(temp, path); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') fail('CONFLICT', '目标刚刚被创建，未覆盖。'); throw error; }
+        published = true;
         await unlink(temp);
       }
-    } catch (error) { try { await unlink(temp); } catch (cleanup) { if (!missing(cleanup)) throw cleanup; } throw error; }
+    } catch (error) {
+      let cleanupError: unknown;
+      try { await unlink(temp); } catch (cleanup) { if (!missing(cleanup)) cleanupError = cleanup; }
+      // Once linked/renamed into place, a cleanup error cannot imply no write.
+      if (published) unverifiedWrite(backupId, cleanupError !== undefined);
+      throw cleanupError ?? error;
+    }
     // Verify the final path, not the temporary file or the intended input buffer.
     // A failure here must not roll back or retry a write that may already exist.
     let verified: Awaited<ReturnType<FileStore['readBytes']>>;
@@ -384,7 +395,7 @@ export class FileStore {
       verified = await this.readBytes(scope, path, options.signal);
       if (!Buffer.from(verified.bytes).equals(bytes) || verified.sha256 !== sha(bytes)) throw new Error('Readback mismatch');
     } catch {
-      fail('WRITE_UNVERIFIED', `写入后未能核验最终文件，目标可能已改变；请先读取核对，不要自动重试。${backupId ? `原内容副本：${backupId}。` : ''}`);
+      unverifiedWrite(backupId);
     }
     return { path, bytes: verified.bytes.byteLength, sha256: verified.sha256, verified: true,
       ...(backupId ? { backupId } : {}), outcome: options.reason === 'restore' ? 'restored' : existing ? 'updated' : 'created' };

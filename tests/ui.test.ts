@@ -121,6 +121,11 @@ async function page(options: {
 }
 const result = (action: string, value: unknown, ok = true): TaskResult => ({id:'task-fixture',state:ok ? 'completed' : 'failed',steps:[{action,ok,...(ok ? {result:value} : {error:String(value)})}]});
 const taskRequests = (view: Awaited<ReturnType<typeof page>>) => view.requests.filter(request => request.path.endsWith('/task'));
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return {promise,resolve};
+}
 
 test('page is self-contained, exposes every grant and has executable inline script', async () => {
   const view = await page();
@@ -353,4 +358,53 @@ test('partial execution shows unchanged and written receipts separately and pres
   assert.match(display,/输出文件：C:\\fixture\\changed\.txt写入并核验完成/);
   assert.doesNotMatch(display,/(?:修改|改写|写入)了?\s*2\s*(?:项|个)/);
   assert.equal(taskRequests(view).length,1); assert.equal(view.nodes.filter(node => node.tagName === 'IMG').length,0);
+});
+
+test('pending saves lock the submitted editor snapshot and reject overlapping saves and reads', {skip:process.platform !== 'win32'}, async t => {
+  const root = await temporaryDirectory(t), workspace = join(root,'workspace'); await mkdir(workspace);
+  const store = new FileStore({backupRoot:join(root,'backups')});
+  const scope = {workspace,scope:'workspace' as const,maxFileBytes:1048576,protectedRoots:[]};
+  const entered = deferred(), release = deferred();
+  const view = await page({configure:state => { state.settings.workspace = workspace; },task:async operations => {
+    const op = operations[0]; assert.equal(op.action,'write');
+    if (op.action !== 'write') throw new Error('Only the submitted save may reach the server');
+    entered.resolve(); await release.promise;
+    return result('write',await store.write(scope,op.path,Buffer.from(op.text),{expectedSha256:op.expectedSha256,createOnly:op.createOnly,backupPolicy:{keepDays:30,maxBytes:1048576}}));
+  }});
+  view.get('editor-path').value = 'draft.txt'; view.get('editor-text').value = 'submitted first draft';
+  const pending = view.fire('editor-form','submit');
+  try {
+    await entered.promise;
+    assert.equal(view.get('editor-path').readOnly,true); assert.equal(view.get('editor-text').readOnly,true);
+    await view.fire('editor-form','submit'); await view.fire('read-file','click');
+    assert.equal(taskRequests(view).length,1);
+    assert.equal(view.get('editor-path').readOnly,true,'a rejected overlapping submission must not unlock the first save');
+    assert.equal(view.get('editor-text').readOnly,true);
+  } finally { release.resolve(); await pending; }
+  assert.equal(await readFile(join(workspace,'draft.txt'),'utf8'),'submitted first draft');
+  assert.equal(view.get('editor-text').value,'submitted first draft');
+  assert.equal(view.get('editor-path').readOnly,false); assert.equal(view.get('editor-text').readOnly,false);
+  assert.match(view.get('editor-note').textContent,/写入并核验完成/);
+  view.get('editor-text').value = 'second draft after the first save'; await view.fire('editor-form','submit');
+  assert.equal(taskRequests(view).length,2);
+  assert.match(taskRequests(view).at(-1)!.body.operations[0].expectedSha256,/^[a-f0-9]{64}$/);
+  assert.equal(await readFile(join(workspace,'draft.txt'),'utf8'),'second draft after the first save');
+});
+
+test('failed or interrupted saves always release editor locks and keep the submitted draft', async () => {
+  for (const interrupted of [false,true]) {
+    const entered = deferred(), release = deferred();
+    const view = await page({task:async () => {
+      entered.resolve(); await release.promise;
+      if (interrupted) throw new Error('synthetic connection failure');
+      return result('write','目标可能已改变，请先读取核对，不要自动重试。',false);
+    }});
+    view.get('editor-path').value = 'draft.txt'; view.get('editor-text').value = 'keep this draft';
+    const pending = view.fire('editor-form','submit');
+    try { await entered.promise; assert.equal(view.get('editor-path').readOnly,true); assert.equal(view.get('editor-text').readOnly,true); }
+    finally { release.resolve(); await pending; }
+    assert.equal(view.get('editor-path').readOnly,false); assert.equal(view.get('editor-text').readOnly,false);
+    assert.equal(view.get('editor-path').value,'draft.txt'); assert.equal(view.get('editor-text').value,'keep this draft');
+    assert.equal(taskRequests(view).length,1); assert.doesNotMatch(view.get('editor-note').textContent,/写入并核验完成/);
+  }
 });

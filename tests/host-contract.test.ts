@@ -4,7 +4,7 @@
  */
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, writeFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -17,7 +17,7 @@ const sdk = process.env.WHALELIFE_SDK;
 const source = fileURLToPath(new URL('../', import.meta.url));
 const enabled = {skip:!sdk ? 'WHALELIFE_SDK is unset: real host compatibility was not tested.' : process.platform !== 'win32' ? 'The computer plugin supports Windows only.' : false,timeout:20000};
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, options: { corruptFinalWrite?: boolean } = {}) {
   let app: any;
   const cleanups: (() => unknown | Promise<unknown>)[] = [];
   // One ordered owner cleanup: close the isolated host/children before removing
@@ -45,6 +45,25 @@ async function fixture(t: TestContext) {
   const install = join(root,'plugins','computer'); await mkdir(install,{recursive:true});
   await cp(join(source,'src'),join(install,'src'),{recursive:true});
   await Promise.all(['index.ts','plugin.yaml'].map(name => cp(join(source,name),join(install,name))));
+  const interference = options.corruptFinalWrite ? 'synthetic post-commit interference ' + randomUUID() : undefined;
+  if (interference) {
+    // Only this owned fixture entrypoint is instrumented. All production modules
+    // remain byte-for-byte copies. Change real disk bytes after the child's real
+    // rename, before its final readback, without timing-dependent external races.
+    const entry = await readFile(join(install,'index.ts'),'utf8');
+    await writeFile(join(install,'index.ts'), `import fs from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
+const originalRename = fs.rename;
+fs.rename = async (from, to) => {
+  await originalRename(from, to);
+  if (String(to).toLowerCase() === ${JSON.stringify(join(install,'data','workspace','contract-input.txt').toLowerCase())}) {
+    fs.rename = originalRename; syncBuiltinESMExports();
+    await fs.writeFile(to, ${JSON.stringify(interference)});
+  }
+};
+syncBuiltinESMExports();
+${entry}`);
+  }
   await app.runtime.scan();
   const record = app.runtime.records.get('computer');
   assert.equal(record?.status,'active',record?.error);
@@ -72,7 +91,7 @@ async function fixture(t: TestContext) {
     const saved = await request('/plugins/computer/api/settings',{revision:state.revision,settings:state.settings});
     assert.equal(saved.status,200); return saved.json();
   };
-  return {root,app,install,url,request,current,session,marker,observed,authorizeFiles,record};
+  return {root,app,install,url,request,current,session,marker,observed,authorizeFiles,record,interference};
 }
 
 test('real host loads the manifest and transient tool; full still needs plugin grants and ask/off do not execute',enabled,async t => {
@@ -147,4 +166,57 @@ test('real Web conversation supplies current route identity while file body stay
   const rows = await f.app.memory.readSession(f.current);
   assert.ok(rows.some((row: any) => row.role === 'assistant' && row.text === '合成任务已完成。'));
   assert.ok(!JSON.stringify(rows).includes(f.marker),'temporary file body must not enter durable conversation/tool history');
+});
+
+test('real host forwards a verified unchanged write while retaining only the minimal action receipt',enabled,async t => {
+  const f = await fixture(t); await f.authorizeFiles();
+  const target = join(f.install,'data','workspace','contract-input.txt');
+  const read = await f.app.tools.call('computer_task',{operations:[{action:'read',path:'contract-input.txt'}]},f.session);
+  assert.equal(read.result.state,'completed');
+  const digest = read.result.steps[0].result.sha256, before = await stat(target,{bigint:true});
+  const answer = await f.app.tools.call('computer_task',{operations:[{action:'write',path:'contract-input.txt',text:f.marker,expectedSha256:digest}]},f.session);
+  assert.equal(answer.ok,true); assert.equal(answer.result.state,'completed');
+  assert.equal(answer.result.steps.length,1); assert.equal(answer.result.steps[0].ok,true);
+  const written = answer.result.steps[0].result;
+  assert.equal(written.outcome,'unchanged'); assert.equal(written.verified,true);
+  assert.equal(written.sha256,digest); assert.equal(written.bytes,Buffer.byteLength(f.marker));
+  assert.equal(written.backupId,undefined);
+  const after = await stat(target,{bigint:true});
+  assert.equal(after.ino,before.ino); assert.equal(after.mtimeNs,before.mtimeNs);
+  assert.equal(await readFile(target,'utf8'),f.marker);
+  await assert.rejects(stat(join(f.install,'data','backups')),{code:'ENOENT'});
+  const retained = f.app.tools.stored(answer);
+  assert.equal(retained.transient,true);
+  assert.deepEqual(retained.result,{action:'computer_task',taskId:answer.result.id,state:'completed',steps:[{action:'write',ok:true}]});
+  assert.deepEqual(f.observed.at(-1).result,retained.result);
+  assert.ok(!JSON.stringify(retained).includes(f.marker)); assert.ok(!JSON.stringify(retained).includes('contract-input.txt'));
+});
+
+test('real host forwards final-write verification failure and recovery reference without persisting file details',enabled,async t => {
+  const f = await fixture(t,{corruptFinalWrite:true}); await f.authorizeFiles();
+  const read = await f.app.tools.call('computer_task',{operations:[{action:'read',path:'contract-input.txt'}]},f.session);
+  assert.equal(read.result.state,'completed');
+  const intended = 'synthetic intended replacement ' + randomUUID();
+  const answer = await f.app.tools.call('computer_task',{operations:[
+    {action:'write',path:'contract-input.txt',text:intended,expectedSha256:read.result.steps[0].result.sha256},
+    {action:'write',path:'must-not-run.txt',text:'must not be created after failure',createOnly:true},
+  ]},f.session);
+  assert.equal(answer.ok,true,'host protocol completion is separate from the task outcome');
+  assert.equal(answer.result.state,'failed'); assert.equal(answer.result.steps.length,1);
+  const step = answer.result.steps[0]; assert.equal(step.action,'write'); assert.equal(step.ok,false); assert.equal(step.result,undefined);
+  // TaskResult exposes the safe WRITE_UNVERIFIED message, not the internal error code.
+  assert.match(step.error,/写入后未能核验最终文件/); assert.match(step.error,/目标可能已改变/);
+  assert.match(step.error,/请先读取核对/); assert.match(step.error,/不要自动重试/);
+  const backupId = /原内容副本：([0-9a-f-]{36})/.exec(step.error)?.[1]; assert.ok(backupId);
+  assert.equal(await readFile(join(f.install,'data','backups',backupId + '.bin'),'utf8'),f.marker);
+  assert.equal(await readFile(join(f.install,'data','workspace','contract-input.txt'),'utf8'),f.interference,'the real post-commit interference was not retried away');
+  await assert.rejects(stat(join(f.install,'data','workspace','must-not-run.txt')),{code:'ENOENT'});
+  const immediate = JSON.stringify(answer);
+  for (const content of [f.marker,intended,f.interference!]) assert.ok(!immediate.includes(content));
+  const retained = f.app.tools.stored(answer);
+  assert.equal(retained.transient,true);
+  assert.deepEqual(retained.result,{action:'computer_task',taskId:answer.result.id,state:'failed',steps:[{action:'write',ok:false}]});
+  assert.deepEqual(f.observed.at(-1).result,retained.result);
+  const durable = JSON.stringify(retained);
+  for (const detail of [f.marker,intended,f.interference!,backupId,'contract-input.txt',step.error]) assert.ok(!durable.includes(detail));
 });
