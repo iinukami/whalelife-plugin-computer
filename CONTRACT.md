@@ -25,6 +25,12 @@
 
 `write`、`document`、导出和 `restore` 覆盖已有文件时需要当前 SHA-256；缺失文件若提供旧摘要则冲突。`edit.find` 必须恰好匹配一次。`delete` 仅接受普通文件。文档格式为 `docx`、`md`、`html`，路径扩展名必须一致。
 
+写入、编辑、文档生成、恢复及执行输出导入均先检查原有摘要和 `createOnly` 等前置条件。即使目标内容相同，旧摘要不匹配或 `createOnly` 遇到已有文件仍然拒绝。通过检查并实际读取到相同内容后，返回 `outcome: "unchanged"`、`verified: true`；不写入、不创建备份，也不修改文件的修改时间。
+
+内容发生变化时，文件结果的 `outcome` 为 `created`、`updated` 或 `restored`，只有最终目标文件读回与预期内容匹配后才返回 `verified: true`。这份核验仅说明当次读回的文件快照符合预期，不保证文件之后不会被其他程序改动。`delete`、`mkdir` 沿用各自原有结果，不因动作完成而附带文件内容已核验的含义。
+
+最终读回失败或不匹配会抛出 `WRITE_UNVERIFIED`，任务标为失败；普通文件动作通过步骤 `error`、执行输出导入通过 `importError` 提示目标可能已经改变。调用者须先读取核对，不能自动重试，也不能把失败理解为目标未被改动。若已有旧版本备份，错误提示保留其 `backupId`，供核对或恢复。
+
 `execute.inputs` 最多 16 项，每项 `{ path, name }`；`outputs` 最多 16 项，每项 `{ name, path, expectedSha256?, createOnly? }`。`name` 是临时目录中的简单文件名，不可包含目录、保留设备名或大小写重复项。脚本工作目录只含输入副本，运行时文件位于另一只读目录。输入总量不超过单文件上限，输出逐文件校验。`timeoutSeconds` 范围 1–300，实际不超过任务设置。
 
 工具请求字符串累计最多 768,000 字节、6,000 个节点、嵌套深度 5；`text`/`code` 每字段最多 256,000 个字符，原生脚本进一步限制为 128 KiB。文档最多 2,000 段、每段 16,000 字符、总文字 512,000 字节。较大的资料应分步处理。
@@ -35,15 +41,15 @@
 {
   "id": "task-uuid",
   "state": "completed",
-  "steps": [{ "action": "write", "ok": true, "result": { "outcome": "created" } }]
+  "steps": [{ "action": "write", "ok": true, "result": { "outcome": "created", "verified": true } }]
 }
 ```
 
 `state` 为 `completed`、`failed` 或 `cancelled`；拒绝任务时为 `{ state: "rejected", error: { code, message }, retryAutomatically: false }`。外层工具调用 `ok` 仅表示协议调用完成，业务结果以这些字段为准。动作失败后不继续后续动作，已完成结果保留。
 
-执行结果含 `status`、`exitCode`、`stdout`、`stderr`、`truncated`、`elapsedMs`、`saved`、`outputsImported` 及可选失败说明。`status` 正常且 `exitCode === 0` 才能导出；部分导出失败时 `saved` 保留成功项并提供 `importError`。清理失败提供失败状态或 `cleanupError`。超时和取消也不是成功。不得从“工具返回成功”或“文件生成成功”推断已向 QQ 发出文件。
+执行结果含 `status`、`exitCode`、`stdout`、`stderr`、`truncated`、`elapsedMs`、`saved`、`outputsImported` 及可选失败说明。`status` 正常且 `exitCode === 0` 才能导出。`saved` 按原请求 `outputs` 顺序保留从第一项起已确认达到目标内容的连续前缀，每项区分 `unchanged` 与实际写入结果；`saved.length` 不能当成改写文件数。部分导出失败时保留该前缀并提供 `importError`，失败项本身可能已改变，必须先读取核对。清理失败提供失败状态或 `cleanupError`。超时和取消也不是成功。不得从“工具返回成功”或“文件生成成功”推断已向 QQ 发出文件。
 
-整个工具临时返回超出 56,000 字节时省略正文并设置 `truncated: true`，保留部分导入及清理失败信息。元数据仍然过大时也省略路径，`savedCount` 表示原请求 `outputs` 中从第一项起已经确认保存的连续项数。调用者应缩小读取范围核对结果，不能重放已完成动作。持久回执仅保留受信任务编号、状态、动作及成功标记，不保存路径、文件正文、命令或输出。
+整个工具临时返回超出 56,000 字节时省略正文并设置 `truncated: true`，保留部分导入及清理失败信息，以及结果中的 `verified` 标记。元数据仍然过大时也省略路径，保留原有兼容字段和单项文件动作的 `verified`；执行输出的逐项元数据被省略，不新增执行结果整体的 `verified` 标记。此时 `savedCount` 表示原请求 `outputs` 中从第一项起已经确认达到目标内容的连续项数，包含未改写项；新增 `unchangedCount` 表示该前缀中的未改写项数，`unchangedOutputs` 列出它们在原请求 `outputs` 中的一基序号。没有读回核验标记不能推断已核验。调用者应缩小读取范围核对结果，不能重放已完成动作。持久回执仅保留受信任务编号、状态、动作及成功标记，不保存路径、文件正文、命令或输出。
 
 ## 来源核验
 

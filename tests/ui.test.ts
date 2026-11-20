@@ -138,7 +138,7 @@ test('read text and file names remain text; overwrites use the read version', as
     const op = operations[0];
     if (op.action === 'list') return result('list',{items:[{path:payload,kind:'file',size:2,modifiedAt:'2026-01-01T00:00:00Z'}]});
     if (op.action === 'read') return result('read',{path:'C:\\fixture\\notes.txt',text:payload,sha256:sha,totalBytes:payload.length,truncated:false,offset:0});
-    return result(op.action,{path:'C:\\fixture\\notes.txt',sha256:'b'.repeat(64),outcome:'updated'});
+    return result(op.action,{path:'C:\\fixture\\notes.txt',sha256:'b'.repeat(64),outcome:'updated',verified:true});
   }});
   await view.fire('browse-form','submit'); assert.ok(view.get('file-list').textContent.includes(payload));
   view.get('editor-path').value = 'notes.txt'; await view.fire('read-file','click');
@@ -221,7 +221,7 @@ test('restoring over an existing file requires its matching read version', async
     const op = ops[0];
     if (op.action === 'backups') return result('backups',{items:[{id:'backup-fixture',path,createdAt:'2026-01-01T00:00:00Z',size:4,sha256:sha,reason:'overwrite'}]});
     if (op.action === 'read') return result('read',{path,text:'current',sha256:sha,totalBytes:7,truncated:false,offset:0});
-    return result(op.action,{path,outcome:'restored'});
+    return result(op.action,{path,outcome:'restored',verified:true});
   }});
   await view.fire('load-backups','click');
   const select = view.nodes.find(node => node.tagName === 'BUTTON' && node.textContent === '选择此版本')!;
@@ -229,6 +229,7 @@ test('restoring over an existing file requires its matching read version', async
   await view.fire('restore-backup','click'); assert.equal(taskRequests(view).length,1);
   view.get('editor-path').value = path; await view.fire('read-file','click'); await view.fire('restore-backup','click');
   assert.deepEqual(taskRequests(view).at(-1)!.body.operations[0],{action:'restore',backupId:'backup-fixture',expectedSha256:sha});
+  assert.match(view.get('backups-result').textContent,/写入并核验完成/);
 });
 
 test('failed execution preserves visible diagnostics and imported outputs, and restoration needs write authority', async () => {
@@ -292,4 +293,64 @@ test('PowerShell stays unavailable even when a file-presence probe reports it', 
   assert.ok(powershellOnly.nodes.filter(node => node.dataset.requires === 'execute').every(node => node.disabled));
   assert.match(powershellOnly.get('execute-availability').textContent,/没有可用的 Node.js/);
   await powershellOnly.fire('execute-form','submit'); assert.equal(taskRequests(powershellOnly).length,0);
+});
+
+test('an unchanged save displays a verified no-op and retains the expected version for the next edit', async () => {
+  const path = 'C:\\fixture\\same.txt', sha = 'd'.repeat(64);
+  const view = await page({task:ops => ops[0].action === 'read'
+    ? result('read',{path,text:'same content',sha256:sha,totalBytes:12,truncated:false,offset:0})
+    : result('write',{path,sha256:sha,bytes:12,outcome:'unchanged',verified:true})});
+  view.get('editor-path').value = 'same.txt'; await view.fire('read-file','click'); await view.fire('editor-form','submit');
+  assert.match(view.get('files-result').textContent,/内容已相同，未改写；已读取核验/);
+  assert.match(view.get('editor-note').textContent,/内容已相同，未改写/);
+  assert.doesNotMatch(view.get('files-result').textContent,/写入并核验完成|已保留恢复副本/);
+  assert.match(view.get('files-result').textContent,/核验仅反映当次文件内容/);
+  assert.equal(taskRequests(view).length,2);
+  assert.equal(taskRequests(view).at(-1)!.body.operations[0].expectedSha256,sha);
+  view.get('editor-text').value = 'next edit'; await view.fire('editor-form','submit');
+  assert.equal(taskRequests(view).at(-1)!.body.operations[0].expectedSha256,sha);
+});
+
+test('file mutation receipts claim verification only when explicitly confirmed and ordinary mkdir stays unchanged', async () => {
+  for (const outcome of ['created','updated','restored','unchanged']) {
+    for (const verified of [true,false,undefined]) {
+      const view = await page({task:() => result('write',{path:'C:\\fixture\\file.txt',sha256:'a'.repeat(64),outcome,...(verified === undefined ? {} : {verified})})});
+      view.get('editor-path').value = 'file.txt'; view.get('editor-text').value = 'content'; await view.fire('editor-form','submit');
+      const display = view.get('files-result').textContent + view.get('editor-note').textContent;
+      if (verified === true) assert.match(display,outcome === 'unchanged' ? /内容已相同，未改写；已读取核验/ : /写入并核验完成/);
+      else { assert.match(display,/未提供读回核验记录/); assert.doesNotMatch(display,/写入并核验完成|已读取核验/); }
+      assert.equal(taskRequests(view).at(-1)!.body.operations[0].createOnly,true);
+    }
+  }
+  const ordinary = await page({task:() => result('mkdir',{path:'C:\\fixture\\folder',outcome:'created'})});
+  ordinary.get('mkdir-path').value = 'folder'; await ordinary.fire('mkdir-form','submit');
+  assert.match(ordinary.get('files-result').textContent,/创建文件夹：完成/);
+  assert.doesNotMatch(ordinary.get('files-result').textContent,/读回核验|写入并核验完成/);
+});
+
+test('unverified write failure preserves its caution and backup reference without retrying or discarding the draft', async () => {
+  const message = 'WRITE_UNVERIFIED：目标可能已改变，请先读取核对，勿自动重试。旧副本 backup-fixture <img src=x>。';
+  const view = await page({task:() => result('write',message,false)});
+  view.get('editor-path').value = 'file.txt'; view.get('editor-text').value = 'keep this draft'; await view.fire('editor-form','submit');
+  assert.ok(view.get('files-result').textContent.includes(message));
+  assert.doesNotMatch(view.get('files-result').textContent,/写入并核验完成/);
+  assert.equal(view.get('editor-text').value,'keep this draft'); assert.equal(taskRequests(view).length,1);
+  assert.equal(view.nodes.filter(node => node.tagName === 'IMG').length,0);
+});
+
+test('partial execution shows unchanged and written receipts separately and preserves import verification errors', async () => {
+  const importError = 'WRITE_UNVERIFIED：第三项目标可能已改变，请先读取核对，勿自动重试。旧副本 backup-fixture <img src=x>。';
+  const view = await page({configure:state => { state.settings.grants.execute = true; state.availability.execute = {available:true,runtimes:['node']}; },task:() => ({
+    id:'task-fixture',state:'failed',steps:[{action:'execute',ok:false,error:'输出未全部保存',result:{
+      status:'completed',exitCode:0,outputsImported:false,importError,cleanupError:'请核对本次执行目录。',
+      saved:[{path:'C:\\fixture\\same.txt',outcome:'unchanged',verified:true},{path:'C:\\fixture\\changed.txt',outcome:'updated',verified:true}],
+    }}],
+  })});
+  view.get('execute-code').value = 'console.log(1)'; await view.fire('execute-form','submit');
+  const display = view.get('execute-result').textContent;
+  assert.match(display,/执行代码：未完成/); assert.ok(display.includes(importError)); assert.match(display,/请核对本次执行目录/);
+  assert.match(display,/输出文件：C:\\fixture\\same\.txt内容已相同，未改写；已读取核验/);
+  assert.match(display,/输出文件：C:\\fixture\\changed\.txt写入并核验完成/);
+  assert.doesNotMatch(display,/(?:修改|改写|写入)了?\s*2\s*(?:项|个)/);
+  assert.equal(taskRequests(view).length,1); assert.equal(view.nodes.filter(node => node.tagName === 'IMG').length,0);
 });

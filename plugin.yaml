@@ -1,5 +1,5 @@
 id: computer
 name: 电脑与文件
-version: 0.1.0
+version: 0.1.1
 description: Windows 本地文件、文档与隔离执行；按能力授权并保留恢复副本
 apiVersion: "1.0.0"

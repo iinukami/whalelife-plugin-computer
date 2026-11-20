@@ -33,7 +33,7 @@ export interface BackupEntry {
 }
 export interface FileInfo { path: string; kind: 'file' | 'directory'; size: number; modifiedAt: string }
 export interface FileRead { path: string; text: string; sha256: string; totalBytes: number; truncated: boolean; offset: number; nextOffset?: number }
-export interface FileMutation { path: string; bytes?: number; sha256?: string; backupId?: string; outcome: 'created' | 'updated' | 'deleted' | 'restored' }
+export interface FileMutation { path: string; bytes?: number; sha256?: string; backupId?: string; verified?: true; outcome: 'created' | 'updated' | 'deleted' | 'restored' | 'unchanged' }
 export type FileOperation =
   | { action: 'list'; path?: string; offset?: number; limit?: number }
   | { action: 'search'; path?: string; query: string; content?: boolean; offset?: number; limit?: number }

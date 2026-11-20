@@ -34,5 +34,5 @@ function visit(directory) {
   }
 }
 visit(out);
-writeFileSync(join(out, 'BUILD.json'), JSON.stringify({ package: 'whalelife-plugin-computer', version: '0.1.0', node: process.version, platform: process.platform, arch: process.arch, files }, null, 2) + '\n');
+writeFileSync(join(out, 'BUILD.json'), JSON.stringify({ package: 'whalelife-plugin-computer', version: '0.1.1', node: process.version, platform: process.platform, arch: process.arch, files }, null, 2) + '\n');
 console.log(`Built ${Object.keys(files).length} files in dist/computer.`);

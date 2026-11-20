@@ -357,6 +357,12 @@ export class FileStore {
     const path = await this.#path(scope, requested, true);
     if (!(await lstat(dirname(path))).isDirectory()) fail('NOT_DIRECTORY', '父目录不存在或不是目录。');
     const existing = await this.#existing(scope, path, options);
+    // Authorization and version/create-only checks still apply to a no-op.
+    // Do not touch the file or prune/create backups when its bytes already match.
+    if (existing && Buffer.from(existing.bytes).equals(bytes)) {
+      checkSignal(options.signal);
+      return { path, bytes: existing.bytes.byteLength, sha256: existing.sha256, outcome: 'unchanged', verified: true };
+    }
     const backupId = existing ? await this.#backup(path, existing.bytes, options.reason ?? 'overwrite', options.backupPolicy) : undefined;
     const temp = join(dirname(path), `.computer-write-${randomUUID()}.tmp`);
     await this.#writeNew(temp, bytes);
@@ -371,7 +377,17 @@ export class FileStore {
         await unlink(temp);
       }
     } catch (error) { try { await unlink(temp); } catch (cleanup) { if (!missing(cleanup)) throw cleanup; } throw error; }
-    return { path, bytes: bytes.byteLength, sha256: sha(bytes), ...(backupId ? { backupId } : {}), outcome: options.reason === 'restore' ? 'restored' : existing ? 'updated' : 'created' };
+    // Verify the final path, not the temporary file or the intended input buffer.
+    // A failure here must not roll back or retry a write that may already exist.
+    let verified: Awaited<ReturnType<FileStore['readBytes']>>;
+    try {
+      verified = await this.readBytes(scope, path, options.signal);
+      if (!Buffer.from(verified.bytes).equals(bytes) || verified.sha256 !== sha(bytes)) throw new Error('Readback mismatch');
+    } catch {
+      fail('WRITE_UNVERIFIED', `写入后未能核验最终文件，目标可能已改变；请先读取核对，不要自动重试。${backupId ? `原内容副本：${backupId}。` : ''}`);
+    }
+    return { path, bytes: verified.bytes.byteLength, sha256: verified.sha256, verified: true,
+      ...(backupId ? { backupId } : {}), outcome: options.reason === 'restore' ? 'restored' : existing ? 'updated' : 'created' };
   }
 
   write(scope: FileScope, path: string, bytes: Uint8Array, options: WriteOptions): Promise<FileMutation> {

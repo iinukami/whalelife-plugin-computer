@@ -24,6 +24,10 @@ async function fixture(t: TestContext) {
   return { root, workspace, outside, protectedRoot, backupRoot, store, scope, put };
 }
 
+async function recoveryFiles(root: string) {
+  return Promise.all((await readdir(root)).sort().map(async name => ({ name, bytes: await readFile(join(root, name)) })));
+}
+
 test('creates and reads Unicode files, reports whole-file digest and bounded pages', async t => {
   const f = await fixture(t);
   const first = await f.put('中文.txt', '甲😀乙丙');
@@ -258,4 +262,160 @@ test('concurrent writes with one expected digest commit at most once', async t =
   assert.equal(await readFile(join(f.workspace, 'one.txt'), 'utf8'), 'first');
   assert.equal((await f.store.backups(f.scope)).total, 1);
   assert.ok(!(await readdir(f.workspace)).some(name => name.startsWith('.computer-write-')));
+});
+
+test('created and changed files are read back from their final path before reporting verified success', async t => {
+  const f = await fixture(t), target = join(f.workspace, 'verified.txt');
+  const originalRead = f.store.readBytes.bind(f.store);
+  const observed: Awaited<ReturnType<FileStore['readBytes']>>[] = [];
+  t.mock.method(f.store, 'readBytes', async (...args: Parameters<FileStore['readBytes']>) => {
+    const result = await originalRead(...args);
+    observed.push({ ...result, bytes: Buffer.from(result.bytes) });
+    return result;
+  });
+  let expectedSha256: string | undefined;
+  for (const [contents, outcome] of [['第一版 😀', 'created'], ['第二版 changed', 'updated']] as const) {
+    observed.length = 0;
+    const result = await f.put('verified.txt', contents, { expectedSha256 });
+    const final = observed.at(-1);
+    assert.ok(final, 'the final file must have been read, including on initial creation');
+    assert.equal(final.path, target);
+    assert.deepEqual(Buffer.from(final.bytes), await readFile(target));
+    assert.equal(Buffer.from(final.bytes).toString(), contents);
+    assert.equal(result.outcome, outcome);
+    assert.equal(result.verified, true);
+    assert.equal(result.bytes, final.bytes.byteLength);
+    assert.equal(result.sha256, final.sha256);
+    expectedSha256 = result.sha256;
+  }
+});
+
+test('identical writes preserve inode, modification time and expired recovery copies without applying quota cleanup', async t => {
+  const f = await fixture(t), contents = 'identical fixture 😀', target = join(f.workspace, 'same.txt');
+  await f.put('history.txt', 'old history');
+  const changed = await f.put('history.txt', 'new history', { expectedSha256: hash('old history') });
+  const index = join(f.backupRoot, `${changed.backupId}.json`), metadata = JSON.parse(await readFile(index, 'utf8'));
+  await writeFile(index, JSON.stringify({ ...metadata, createdAt: new Date(Date.now() - 30 * 86400000).toISOString() }));
+  await f.put('same.txt', contents);
+  const before = await stat(target, { bigint: true }), backupsBefore = await recoveryFiles(f.backupRoot);
+  const workspaceBefore = (await readdir(f.workspace)).sort();
+  for (const backupPolicy of [policy, { keepDays: 1, maxBytes: 1 }]) {
+    const result = await f.store.write(f.scope, 'same.txt', Buffer.from(contents), { expectedSha256: hash(contents), backupPolicy });
+    assert.equal(result.outcome, 'unchanged');
+    assert.equal(result.verified, true);
+    assert.equal(result.bytes, Buffer.byteLength(contents));
+    assert.equal(result.sha256, hash(contents));
+    assert.equal(result.backupId, undefined);
+    const after = await stat(target, { bigint: true });
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mtimeNs, before.mtimeNs);
+    assert.deepEqual(await recoveryFiles(f.backupRoot), backupsBefore);
+    assert.deepEqual((await readdir(f.workspace)).sort(), workspaceBefore);
+  }
+});
+
+test('identical contents cannot bypass missing or stale digests or create-only conflicts', async t => {
+  const f = await fixture(t), contents = 'guarded identical contents';
+  await f.put('guarded.txt', contents);
+  for (const options of [{}, { expectedSha256: hash('stale fixture') }, { createOnly: true }, { createOnly: true, expectedSha256: hash(contents) }]) {
+    await assert.rejects(f.put('guarded.txt', contents, options), { code: 'CONFLICT' });
+  }
+  await assert.rejects(f.put('missing.txt', contents, { expectedSha256: hash(contents) }), { code: 'CONFLICT' });
+  assert.equal(await readFile(join(f.workspace, 'guarded.txt'), 'utf8'), contents);
+  assert.deepEqual(await readdir(f.workspace), ['guarded.txt']);
+  await assert.rejects(stat(f.backupRoot), { code: 'ENOENT' });
+});
+
+test('an edit that preserves the bytes is verified and does not create a recovery store', async t => {
+  const f = await fixture(t), contents = 'first second', target = join(f.workspace, 'edit.txt');
+  await f.put('edit.txt', contents);
+  const before = await stat(target, { bigint: true });
+  const result = await f.store.edit(f.scope, 'edit.txt', 'second', 'second', hash(contents), policy);
+  assert.equal(result.outcome, 'unchanged');
+  assert.equal(result.verified, true);
+  assert.equal(result.bytes, Buffer.byteLength(contents));
+  assert.equal(result.sha256, hash(contents));
+  assert.equal(result.backupId, undefined);
+  const after = await stat(target, { bigint: true });
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.mtimeNs, before.mtimeNs);
+  await assert.rejects(stat(f.backupRoot), { code: 'ENOENT' });
+});
+
+test('restoring an already present version returns unchanged without another recovery copy', async t => {
+  const f = await fixture(t), target = join(f.workspace, 'restore.txt');
+  await f.put('restore.txt', 'version A');
+  const changed = await f.put('restore.txt', 'version B', { expectedSha256: hash('version A') });
+  await f.store.restore(f.scope, changed.backupId!, { expectedSha256: hash('version B'), backupPolicy: policy });
+  const before = await stat(target, { bigint: true }), backupsBefore = await recoveryFiles(f.backupRoot);
+  const result = await f.store.restore(f.scope, changed.backupId!, { expectedSha256: hash('version A'), backupPolicy: policy });
+  assert.equal(result.outcome, 'unchanged');
+  assert.equal(result.verified, true);
+  assert.equal(result.bytes, Buffer.byteLength('version A'));
+  assert.equal(result.sha256, hash('version A'));
+  assert.equal(result.backupId, undefined);
+  const after = await stat(target, { bigint: true });
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.mtimeNs, before.mtimeNs);
+  assert.deepEqual(await recoveryFiles(f.backupRoot), backupsBefore);
+  await assert.rejects(f.store.restore(f.scope, changed.backupId!, { createOnly: true, expectedSha256: hash('version A'), backupPolicy: policy }), { code: 'CONFLICT' });
+});
+
+for (const fault of ['read failure', 'different bytes', 'short read', 'different digest'] as const) {
+  test(`post-commit ${fault} is unverified, preserves a usable recovery copy and does not poison the queue`, async t => {
+    const f = await fixture(t), target = join(f.workspace, 'changed.txt');
+    const original = 'original fixture', updated = 'changed fixture';
+    await f.put('changed.txt', original);
+    const originalRead = f.store.readBytes.bind(f.store);
+    let injected = false, message = '';
+    const mock = t.mock.method(f.store, 'readBytes', async (...args: Parameters<FileStore['readBytes']>) => {
+      const result = await originalRead(...args);
+      if (result.path !== target || Buffer.from(result.bytes).toString() !== updated) return result;
+      injected = true;
+      if (fault === 'read failure') throw new Error('private synthetic read error');
+      if (fault === 'different digest') return { ...result, sha256: '0'.repeat(64) };
+      const bytes = fault === 'short read' ? Buffer.from(result.bytes).subarray(0, -1) : Buffer.from('damaged fixture');
+      return { ...result, bytes, sha256: createHash('sha256').update(bytes).digest('hex') };
+    });
+    await assert.rejects(f.put('changed.txt', updated, { expectedSha256: hash(original) }), (error: unknown) => {
+      assert.equal((error as { code?: string }).code, 'WRITE_UNVERIFIED');
+      message = (error as Error).message;
+      assert.match(message, /自动重试/);
+      assert.ok(!message.includes('private synthetic read error'));
+      return true;
+    });
+    assert.equal(injected, true, 'inject only after the final file contains the committed bytes');
+    assert.equal(await readFile(target, 'utf8'), updated, 'unverified does not promise that no mutation occurred');
+    const backups = await f.store.backups(f.scope);
+    assert.equal(backups.total, 1);
+    const recovery = backups.items[0];
+    assert.equal(recovery.sha256, hash(original));
+    assert.ok(message.includes(recovery.id), 'retain the recovery reference in the safe failure message');
+    mock.mock.restore();
+    const restored = await f.store.restore(f.scope, recovery.id, { expectedSha256: hash(updated), backupPolicy: policy });
+    assert.equal(restored.verified, true);
+    assert.equal(await readFile(target, 'utf8'), original);
+    const next = await f.put('later.txt', 'queue remains usable');
+    assert.equal(next.outcome, 'created');
+    assert.equal(next.verified, true);
+    assert.ok(!(await readdir(f.workspace)).some(name => name.startsWith('.computer-write-')));
+  });
+}
+
+test('initial creation with failed final read-back reports unverified even though the file now exists', async t => {
+  const f = await fixture(t), target = join(f.workspace, 'created.txt');
+  const originalRead = f.store.readBytes.bind(f.store);
+  let injected = false;
+  const mock = t.mock.method(f.store, 'readBytes', async (...args: Parameters<FileStore['readBytes']>) => {
+    const result = await originalRead(...args);
+    if (result.path === target) { injected = true; throw new Error('synthetic creation read failure'); }
+    return result;
+  });
+  await assert.rejects(f.put('created.txt', 'created fixture', { createOnly: true }), { code: 'WRITE_UNVERIFIED' });
+  assert.equal(injected, true);
+  assert.equal(await readFile(target, 'utf8'), 'created fixture');
+  await assert.rejects(stat(f.backupRoot), { code: 'ENOENT' });
+  mock.mock.restore();
+  const next = await f.put('next.txt', 'next fixture', { createOnly: true });
+  assert.equal(next.verified, true);
 });

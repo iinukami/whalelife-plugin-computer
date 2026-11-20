@@ -32,7 +32,7 @@ export function renderPage(): string {
 <form id="mkdir-form" class="spaced"><label for="mkdir-path">新建文件夹</label><div class="row"><input id="mkdir-path" class="grow" required placeholder="例如 reports"><button data-requires="write" disabled>创建文件夹</button></div></form><div id="files-result" class="result" aria-live="polite"></div></section>
 <section id="panel-documents" class="panel" role="tabpanel" hidden><h2>生成文档</h2><p class="muted">填写标题和正文，生成的文件保留在指定目录；完成后可获取下载。</p><form id="document-form"><div class="grid"><div><label for="document-format">格式</label><select id="document-format"><option value="docx">Word 文档（.docx）</option><option value="md">Markdown（.md）</option><option value="html">网页文档（.html）</option></select></div><div><label for="document-path">保存路径</label><input id="document-path" required placeholder="例如 reports/说明.docx"></div></div><label for="document-title">文档标题</label><input id="document-title" required maxlength="1000"><label for="document-body">正文段落</label><textarea id="document-body" rows="12" placeholder="用空行分隔段落"></textarea><p class="muted">此入口只创建新文件，已有同名文件会保留。需要修改时请先读取文件。</p><button class="primary" data-requires="write" disabled>生成文档</button></form><div id="documents-result" class="result" aria-live="polite"></div></section>
 <section id="panel-execute" class="panel" role="tabpanel" hidden><h2>离线执行</h2><p id="execute-availability" class="notice">正在核验本机执行环境…</p><p class="muted">首版支持 Node.js，PowerShell 尚未验收，暂不开放。只使用本机已有工具与本地依赖，代码无法直接联网；输入文件须明确列出，输出只按下面的设置保存。</p><form id="execute-form"><div class="grid"><div><label for="execute-runtime">运行方式</label><select id="execute-runtime"><option value="node">Node.js（首版支持）</option><option value="powershell" disabled>PowerShell（未验收，暂不可用）</option></select></div><div><label for="execute-timeout">本次超时（秒）</label><input id="execute-timeout" type="number" min="1" step="1" value="60" required></div></div><label for="execute-code">代码</label><textarea id="execute-code" class="code" rows="12" spellcheck="false" required></textarea><label for="execute-inputs">输入文件（可选，每行一项）</label><textarea id="execute-inputs" class="code compact" placeholder="原文件路径 => 运行环境中的相对文件名"></textarea><label for="execute-output">保存一个输出文件（可选）</label><input id="execute-output" class="code" placeholder="运行环境中的相对文件名 => 目标路径"><p class="muted">输出保存为新文件；不会覆盖已有同名文件。代码运行成功与文件保存成功分别显示。</p><button class="primary" data-requires="execute" disabled>开始执行</button></form><div id="execute-result" class="result" aria-live="polite"></div></section>
-<section id="panel-backups" class="panel" role="tabpanel" hidden><h2>恢复文件</h2><p class="muted">这里仅列出本插件保留的副本。查看需要读取权限；恢复需要同时开放恢复与写入权限。恢复前会核对目标文件当前版本；如目标已变化，请重新读取后再恢复。</p><button type="button" id="load-backups" data-requires="read" disabled>查看可恢复副本</button><ul id="backup-list" class="list"></ul><button id="backup-more" type="button" data-requires="read" hidden disabled>加载更多</button><div id="backup-choice" hidden><h3 id="backup-choice-title"></h3><label for="restore-mode">目标文件状态</label><select id="restore-mode"><option value="new">目标文件不存在</option><option value="existing">替换已在“文件”页读取的当前版本</option></select><p class="muted">替换前会保留当前版本。仅当已读取文件与所选副本路径一致时可替换。</p><button type="button" id="restore-backup" class="primary" data-requires="restore write" disabled>恢复所选副本</button></div><div id="backups-result" class="result" aria-live="polite"></div></section>
+<section id="panel-backups" class="panel" role="tabpanel" hidden><h2>恢复文件</h2><p class="muted">这里仅列出本插件保留的副本。查看需要读取权限；恢复需要同时开放恢复与写入权限。恢复前会核对目标文件当前版本；如目标已变化，请重新读取后再恢复。</p><button type="button" id="load-backups" data-requires="read" disabled>查看可恢复副本</button><ul id="backup-list" class="list"></ul><button id="backup-more" type="button" data-requires="read" hidden disabled>加载更多</button><div id="backup-choice" hidden><h3 id="backup-choice-title"></h3><label for="restore-mode">目标文件状态</label><select id="restore-mode"><option value="new">目标文件不存在</option><option value="existing">替换已在“文件”页读取的当前版本</option></select><p class="muted">替换且内容有变化时会保留当前版本；内容相同则不改写。仅当已读取文件与所选副本路径一致时可替换。</p><button type="button" id="restore-backup" class="primary" data-requires="restore write" disabled>恢复所选副本</button></div><div id="backups-result" class="result" aria-live="polite"></div></section>
 <section id="panel-settings" class="panel" role="tabpanel" hidden><h2>授权与设置</h2><p class="muted">勾选允许使用的能力后保存。取消勾选影响随后启动的任务，已启动任务按原授权完成；显式取消、停用与超时仍然有效。</p><form id="settings-form"><div class="grid">
 <div class="grant"><label class="check"><input id="grant-read" type="checkbox">读取与搜索文件</label><small>浏览目录、读取文件及获取下载。</small></div>
 <div class="grant"><label class="check"><input id="grant-write" type="checkbox">创建与编辑文件</label><small>写文件、创建文件夹及生成文档。</small></div>
@@ -139,10 +139,15 @@ export function renderPage(): string {
     const button = text('button','获取下载'); button.type = 'button'; button.dataset.requires = 'read';
     button.addEventListener('click', () => task([{action:'deliver',path}],'read',target)); target.append(button);
   }
+  function mutationMessage(value) {
+    if (value.outcome === 'unchanged') return value.verified === true ? '内容已相同，未改写；已读取核验。' : '结果报告内容相同、未改写，但未提供读回核验记录；请先读取核对。';
+    if (['created','updated','restored'].includes(value.outcome)) return value.verified === true ? '写入并核验完成。' : '已返回写入结果，未提供读回核验记录；请先读取核对。';
+    return '';
+  }
   function renderResults(target, result) {
     target.replaceChildren(text('h3',stateNames[result.state] || '任务结果'));
     for (const step of result.steps || []) {
-      const executionFailed = step.action === 'execute' && step.result && (step.result.status !== 'completed' || step.result.exitCode !== 0);
+      const executionFailed = step.action === 'execute' && step.result && (step.result.status !== 'completed' || step.result.exitCode !== 0 || step.result.importError || step.result.cleanupError);
       const succeeded = step.ok && !executionFailed;
       const row = text('div',''); row.append(text('p',(actionNames[step.action] || '操作') + '：' + (succeeded ? '完成' : '未完成'),succeeded ? '' : 'danger'));
       if (!step.ok) row.append(text('p',step.error || '结果需要核对，请勿盲目重复操作。','muted'));
@@ -152,8 +157,13 @@ export function renderPage(): string {
         else {
           if (typeof value.path === 'string') row.append(text('p',value.path,'muted'));
           if (value.backupId) row.append(text('p','已保留恢复副本。','muted'));
-          if (['write','edit','document','restore'].includes(step.action)) addDownload(row,value.path);
+          if (['write','edit','document','restore'].includes(step.action)) {
+            const message = mutationMessage(value); if (message) row.append(text('p',message));
+            if (value.verified === true) row.append(text('p','核验仅反映当次文件内容，之后仍可能被其他程序修改。','muted'));
+            addDownload(row,value.path);
+          }
           if (step.action === 'execute') {
+            for (const message of new Set([value.reason,value.importError,value.cleanupError])) if (typeof message === 'string' && message && message !== step.error) row.append(text('p',message,'danger'));
             if (value.exitCode !== undefined) row.append(text('p','退出状态：' + (value.exitCode === null ? '未取得退出码' : value.exitCode)));
             if (value.timedOut) row.append(text('p','已达到执行超时。','danger'));
             if (typeof value.stdout === 'string' && value.stdout) { row.append(text('h4','标准输出'),text('pre',value.stdout)); }
@@ -161,8 +171,13 @@ export function renderPage(): string {
             if (value.outputTruncated || value.truncated) row.append(text('p','输出已限量显示。','muted'));
             const outputs = Array.isArray(value.saved) ? value.saved : value.outputs;
             if (Array.isArray(outputs)) for (const output of outputs) {
-              if (typeof output.path === 'string') { row.append(text('p','输出文件：' + output.path)); addDownload(row,output.path); }
+              if (typeof output.path === 'string') {
+                row.append(text('p','输出文件：' + output.path));
+                const message = mutationMessage(output); if (message) row.append(text('p',message));
+                addDownload(row,output.path);
+              }
             }
+            if (Array.isArray(outputs) && outputs.some(output => output.verified === true)) row.append(text('p','以上核验仅反映当次文件内容；内容已相同的输出未改写。','muted'));
           }
         }
       }
@@ -222,7 +237,7 @@ export function renderPage(): string {
       const complete = data.nextOffset === undefined && (append ? previous.fromStart === true : data.truncated === false);
       loaded = {...data,inputPath:path,combinedText,fromStart:append ? previous.fromStart : data.offset === 0,complete}; el('editor-path').value = data.path;
       el('editor-text').value = combinedText; el('editor-text').readOnly = !complete;
-      el('editor-note').textContent = complete ? '已读取当前完整版本。保存时核对文件未被其他程序改动，覆盖前保留副本。' : '当前只读取了部分正文，暂为只读。继续读取完整文件后才可编辑和覆盖保存。';
+      el('editor-note').textContent = complete ? '已读取当前完整版本。保存时核对当前版本；内容相同则不改写，内容不同时先保留副本。' : '当前只读取了部分正文，暂为只读。继续读取完整文件后才可编辑和覆盖保存。';
       el('read-more').hidden = !Number.isInteger(data.nextOffset); showTab('files');
     });
   }
@@ -237,7 +252,7 @@ export function renderPage(): string {
     const existing = loaded && (loaded.path === path || loaded.inputPath === path);
     if (existing && !loaded.complete) { say('尚未读取完整文件，不能覆盖保存。',true); return; }
     const operation = {action:'write',path,text:el('editor-text').value,...(existing ? {expectedSha256:loaded.sha256} : {createOnly:true})};
-    return task([operation],'write',el('files-result'),result => { const data = success(result); if (data?.sha256) { loaded = {path:data.path || path,inputPath:path,sha256:data.sha256,complete:true}; el('editor-text').readOnly = false; el('read-more').hidden = true; el('editor-note').textContent = '已保存。后续覆盖仍会核对当前版本。'; } });
+    return task([operation],'write',el('files-result'),result => { const data = success(result); if (data?.sha256) { loaded = {path:data.path || path,inputPath:path,sha256:data.sha256,complete:true}; el('editor-text').readOnly = false; el('read-more').hidden = true; el('editor-note').textContent = (mutationMessage(data) || '已收到文件保存结果。') + '后续覆盖仍会核对当前版本。'; } });
   });
   el('delete-file').addEventListener('click',() => {
     const path = el('editor-path').value.trim();
